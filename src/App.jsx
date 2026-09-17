@@ -4,9 +4,17 @@ import { DEFAULT_CONFIG } from './constants';
 import { CircularTimer } from './components/CircularTimer';
 import { Controls } from './components/Controls';
 import { SettingsModal } from './components/SettingsModal';
-import { playChime } from './utils/audio';
+import {
+  playChime,
+  initAudio,
+  startBackgroundAudio,
+  stopBackgroundAudio,
+  setupMediaSession,
+  updateMediaSessionMetadata,
+} from './utils/audio';
 import { requestWakeLock, releaseWakeLock } from './utils/wakeLock';
 import { formatTime, formatHumanTime } from './utils/format';
+import { createTimerWorker } from './utils/timerWorker';
 
 export default function App() {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
@@ -19,7 +27,43 @@ export default function App() {
 
   const intervalEndTimeRef = useRef(0);
   const timerIntervalRef = useRef(null);
+  const timerWorkerRef = useRef(null);
   const elapsedIntervalRef = useRef(null);
+
+  // Synchronized refs to avoid stale closure issues in timer callbacks & key listeners
+  const configRef = useRef(config);
+  const statusRef = useRef(status);
+  const currentIntervalRef = useRef(currentInterval);
+  const currentRoundRef = useRef(currentRound);
+  const secondsLeftRef = useRef(secondsLeft);
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => {
+    currentIntervalRef.current = currentInterval;
+  }, [currentInterval]);
+
+  useEffect(() => {
+    currentRoundRef.current = currentRound;
+  }, [currentRound]);
+
+  useEffect(() => {
+    secondsLeftRef.current = secondsLeft;
+  }, [secondsLeft]);
+
+  // Initialize Web Worker timer on mount
+  useEffect(() => {
+    timerWorkerRef.current = createTimerWorker();
+    return () => {
+      if (timerWorkerRef.current) timerWorkerRef.current.terminate();
+    };
+  }, []);
 
   // Manage browser wake lock while workout is running
   useEffect(() => {
@@ -36,114 +80,228 @@ export default function App() {
   // Sync secondsLeft when config changes while idle
   useEffect(() => {
     if (status === 'idle') {
-      setSecondsLeft(currentInterval === 'run' ? config.runSeconds : config.walkSeconds);
+      const dur = currentInterval === 'run' ? config.runSeconds : config.walkSeconds;
+      setSecondsLeft(dur);
+      secondsLeftRef.current = dur;
     }
   }, [config, status, currentInterval]);
+
+  const clearAllTimerLoops = useCallback(() => {
+    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    if (timerWorkerRef.current) timerWorkerRef.current.stop();
+    if (elapsedIntervalRef.current) clearInterval(elapsedIntervalRef.current);
+  }, []);
 
   // Clean up timers on unmount
   useEffect(() => {
     return () => {
-      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-      if (elapsedIntervalRef.current) clearInterval(elapsedIntervalRef.current);
+      clearAllTimerLoops();
+      stopBackgroundAudio();
     };
-  }, []);
+  }, [clearAllTimerLoops]);
 
   // Interval completion transition
   const handleIntervalCompletion = useCallback(() => {
     playChime();
 
-    if (currentInterval === 'run') {
+    const currInterval = currentIntervalRef.current;
+    const currRound = currentRoundRef.current;
+    const currConfig = configRef.current;
+
+    if (currInterval === 'run') {
       // Transition Run -> Walk
       setCurrentInterval('walk');
-      setSecondsLeft(config.walkSeconds);
-      intervalEndTimeRef.current = Date.now() + config.walkSeconds * 1000;
+      currentIntervalRef.current = 'walk';
+      setSecondsLeft(currConfig.walkSeconds);
+      secondsLeftRef.current = currConfig.walkSeconds;
+      intervalEndTimeRef.current = Date.now() + currConfig.walkSeconds * 1000;
+
+      updateMediaSessionMetadata({
+        phase: 'walk',
+        round: currRound,
+        totalRounds: currConfig.rounds,
+        isInfinite: currConfig.isInfinite,
+      });
     } else {
       // Transition Walk -> Next Round or Completed
-      const isLastRound = !config.isInfinite && currentRound >= config.rounds;
+      const isLastRound = !currConfig.isInfinite && currRound >= currConfig.rounds;
 
       if (isLastRound) {
         setStatus('completed');
-        if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-        if (elapsedIntervalRef.current) clearInterval(elapsedIntervalRef.current);
+        statusRef.current = 'completed';
+        setSecondsLeft(0);
+        secondsLeftRef.current = 0;
+        clearAllTimerLoops();
+        stopBackgroundAudio();
       } else {
-        setCurrentRound((prev) => prev + 1);
+        const nextRound = currRound + 1;
+        setCurrentRound(nextRound);
+        currentRoundRef.current = nextRound;
         setCurrentInterval('run');
-        setSecondsLeft(config.runSeconds);
-        intervalEndTimeRef.current = Date.now() + config.runSeconds * 1000;
+        currentIntervalRef.current = 'run';
+        setSecondsLeft(currConfig.runSeconds);
+        secondsLeftRef.current = currConfig.runSeconds;
+        intervalEndTimeRef.current = Date.now() + currConfig.runSeconds * 1000;
+
+        updateMediaSessionMetadata({
+          phase: 'run',
+          round: nextRound,
+          totalRounds: currConfig.rounds,
+          isInfinite: currConfig.isInfinite,
+        });
       }
     }
-  }, [config, currentInterval, currentRound]);
+  }, [clearAllTimerLoops]);
 
-  // Primary loop manager
+  // Primary loop manager (dual window interval + background Web Worker timer)
   const startTimerLoops = useCallback(() => {
-    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-    if (elapsedIntervalRef.current) clearInterval(elapsedIntervalRef.current);
+    clearAllTimerLoops();
 
-    timerIntervalRef.current = setInterval(() => {
+    const tick = () => {
       const now = Date.now();
       const remainingMs = intervalEndTimeRef.current - now;
       const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
 
       setSecondsLeft(remainingSec);
+      secondsLeftRef.current = remainingSec;
 
       if (remainingMs <= 0) {
         handleIntervalCompletion();
       }
-    }, 200);
+    };
+
+    // Main window timer
+    timerIntervalRef.current = setInterval(tick, 200);
+
+    // Resilient Web Worker timer for background thread ticks when phone is locked
+    if (timerWorkerRef.current) {
+      timerWorkerRef.current.start(250, tick);
+    }
 
     elapsedIntervalRef.current = setInterval(() => {
       setTotalElapsedSeconds((prev) => prev + 1);
     }, 1000);
-  }, [handleIntervalCompletion]);
+  }, [clearAllTimerLoops, handleIntervalCompletion]);
 
   // Start workout
-  const handleStart = () => {
+  const handleStart = useCallback(() => {
+    initAudio();
+    startBackgroundAudio();
+    const currConfig = configRef.current;
     setCurrentInterval('run');
+    currentIntervalRef.current = 'run';
     setCurrentRound(1);
-    setSecondsLeft(config.runSeconds);
+    currentRoundRef.current = 1;
+    setSecondsLeft(currConfig.runSeconds);
+    secondsLeftRef.current = currConfig.runSeconds;
     setTotalElapsedSeconds(0);
     setStatus('running');
+    statusRef.current = 'running';
 
-    intervalEndTimeRef.current = Date.now() + config.runSeconds * 1000;
+    intervalEndTimeRef.current = Date.now() + currConfig.runSeconds * 1000;
     startTimerLoops();
-  };
+
+    updateMediaSessionMetadata({
+      phase: 'run',
+      round: 1,
+      totalRounds: currConfig.rounds,
+      isInfinite: currConfig.isInfinite,
+    });
+  }, [startTimerLoops]);
 
   // Pause workout
-  const handlePause = () => {
+  const handlePause = useCallback(() => {
     setStatus('paused');
-    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-    if (elapsedIntervalRef.current) clearInterval(elapsedIntervalRef.current);
-  };
+    statusRef.current = 'paused';
+    clearAllTimerLoops();
+    stopBackgroundAudio();
+  }, [clearAllTimerLoops]);
 
   // Resume workout
-  const handleResume = () => {
+  const handleResume = useCallback(() => {
+    initAudio();
+    startBackgroundAudio();
     setStatus('running');
-    intervalEndTimeRef.current = Date.now() + secondsLeft * 1000;
+    statusRef.current = 'running';
+    const remaining = secondsLeftRef.current;
+    intervalEndTimeRef.current = Date.now() + remaining * 1000;
     startTimerLoops();
-  };
+
+    updateMediaSessionMetadata({
+      phase: currentIntervalRef.current,
+      round: currentRoundRef.current,
+      totalRounds: configRef.current.rounds,
+      isInfinite: configRef.current.isInfinite,
+    });
+  }, [startTimerLoops]);
 
   // Reset workout
-  const handleReset = () => {
-    if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-    if (elapsedIntervalRef.current) clearInterval(elapsedIntervalRef.current);
+  const handleReset = useCallback(() => {
+    clearAllTimerLoops();
+    stopBackgroundAudio();
 
+    const currConfig = configRef.current;
     setStatus('idle');
+    statusRef.current = 'idle';
     setCurrentInterval('run');
-    setSecondsLeft(config.runSeconds);
+    currentIntervalRef.current = 'run';
     setCurrentRound(1);
+    currentRoundRef.current = 1;
+    setSecondsLeft(currConfig.runSeconds);
+    secondsLeftRef.current = currConfig.runSeconds;
     setTotalElapsedSeconds(0);
-  };
+  }, [clearAllTimerLoops]);
 
   // Skip interval
-  const handleSkip = () => {
-    handleIntervalCompletion();
-  };
+  const handleSkip = useCallback(() => {
+    initAudio();
+    const currStatus = statusRef.current;
+    if (currStatus === 'running' || currStatus === 'paused') {
+      handleIntervalCompletion();
+    }
+  }, [handleIntervalCompletion]);
+
+  // Setup lock-screen media session controls once
+  useEffect(() => {
+    setupMediaSession({
+      onPlay: () => {
+        if (statusRef.current === 'paused') handleResume();
+        else if (statusRef.current === 'idle') handleStart();
+      },
+      onPause: () => {
+        if (statusRef.current === 'running') handlePause();
+      },
+      onSkip: () => {
+        if (statusRef.current === 'running' || statusRef.current === 'paused') handleSkip();
+      },
+    });
+  }, [handleStart, handlePause, handleResume, handleSkip]);
+
+  // Re-sync immediately on phone unlock / visibility change
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && statusRef.current === 'running') {
+        const now = Date.now();
+        const remainingMs = intervalEndTimeRef.current - now;
+        const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
+        setSecondsLeft(remainingSec);
+        secondsLeftRef.current = remainingSec;
+        if (remainingMs <= 0) {
+          handleIntervalCompletion();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [handleIntervalCompletion]);
 
   // Save new configuration
   const handleSaveConfig = (newConfig) => {
     setConfig(newConfig);
-    if (status === 'idle') {
+    configRef.current = newConfig;
+    if (statusRef.current === 'idle') {
       setSecondsLeft(newConfig.runSeconds);
+      secondsLeftRef.current = newConfig.runSeconds;
     }
   };
 
@@ -154,19 +312,20 @@ export default function App() {
 
       if (e.code === 'Space') {
         e.preventDefault();
-        if (status === 'idle' || status === 'completed') handleStart();
-        else if (status === 'running') handlePause();
-        else if (status === 'paused') handleResume();
+        const currStatus = statusRef.current;
+        if (currStatus === 'idle' || currStatus === 'completed') handleStart();
+        else if (currStatus === 'running') handlePause();
+        else if (currStatus === 'paused') handleResume();
       } else if (e.code === 'KeyR') {
-        if (status !== 'idle') handleReset();
+        if (statusRef.current !== 'idle') handleReset();
       } else if (e.code === 'KeyS') {
-        if (status === 'running' || status === 'paused') handleSkip();
+        if (statusRef.current === 'running' || statusRef.current === 'paused') handleSkip();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [status, isSettingsOpen, secondsLeft, config]);
+  }, [isSettingsOpen]);
 
   const totalIntervalSeconds = currentInterval === 'run' ? config.runSeconds : config.walkSeconds;
   const isRunningPhase = currentInterval === 'run';
