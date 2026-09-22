@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { X, Volume2 } from 'lucide-react';
-import { WORKOUT_PRESETS } from '../constants';
+import { X, Volume2, RotateCcw } from 'lucide-react';
+import { WORKOUT_PRESETS, DEFAULT_CONFIG } from '../constants';
 import { formatTime } from '../utils/format';
 import { playChime } from '../utils/audio';
 
@@ -43,6 +43,15 @@ export function SettingsModal({
   }, [isOpen, onClose]);
 
   if (!isOpen) return null;
+
+  const handleResetDefaults = () => {
+    setRunMin(Math.floor(DEFAULT_CONFIG.runSeconds / 60));
+    setRunSec(DEFAULT_CONFIG.runSeconds % 60);
+    setWalkMin(Math.floor(DEFAULT_CONFIG.walkSeconds / 60));
+    setWalkSec(DEFAULT_CONFIG.walkSeconds % 60);
+    setRounds(DEFAULT_CONFIG.rounds);
+    setIsInfinite(DEFAULT_CONFIG.isInfinite);
+  };
 
   const applyPreset = (preset) => {
     setRunMin(Math.floor(preset.runSeconds / 60));
@@ -89,7 +98,13 @@ export function SettingsModal({
       <div className="modal-dialog" onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="modal-header">
-          <h2 className="modal-title">Configure Practice Timers</h2>
+          <div className="modal-header-text">
+            <h2 className="modal-title">Configure Practice Timers</h2>
+            <div className="storage-status-pill">
+              <span className="storage-dot"></span>
+              <span>Saved in LocalStorage</span>
+            </div>
+          </div>
           <button
             id="btn-close-modal"
             className="btn-close-modal"
@@ -279,12 +294,24 @@ export function SettingsModal({
 
         {/* Footer */}
         <div className="modal-footer">
-          <button className="btn-modal-cancel" onClick={onClose}>
-            Cancel
+          <button
+            id="btn-reset-defaults"
+            type="button"
+            className="btn-modal-reset"
+            onClick={handleResetDefaults}
+            title="Reset to default timer intervals (2m run, 1m walk)"
+          >
+            <RotateCcw size={14} />
+            <span>Reset Defaults</span>
           </button>
-          <button id="btn-save-timers" className="btn-modal-save" onClick={handleSave}>
-            Save Timers
-          </button>
+          <div className="modal-footer-actions">
+            <button className="btn-modal-cancel" onClick={onClose}>
+              Cancel
+            </button>
+            <button id="btn-save-timers" className="btn-modal-save" onClick={handleSave}>
+              Save Timers
+            </button>
+          </div>
         </div>
       </div>
     </div>

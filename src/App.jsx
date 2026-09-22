@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Zap, Clock } from 'lucide-react';
-import { DEFAULT_CONFIG } from './constants';
 import { CircularTimer } from './components/CircularTimer';
 import { Controls } from './components/Controls';
 import { SettingsModal } from './components/SettingsModal';
@@ -15,12 +14,13 @@ import {
 import { requestWakeLock, releaseWakeLock } from './utils/wakeLock';
 import { formatTime, formatHumanTime } from './utils/format';
 import { createTimerWorker } from './utils/timerWorker';
+import { getStoredTimerConfig, saveStoredTimerConfig } from './utils/storage';
 
 export default function App() {
-  const [config, setConfig] = useState(DEFAULT_CONFIG);
+  const [config, setConfig] = useState(() => getStoredTimerConfig());
   const [status, setStatus] = useState('idle'); // 'idle' | 'running' | 'paused' | 'completed'
   const [currentInterval, setCurrentInterval] = useState('run'); // 'run' | 'walk'
-  const [secondsLeft, setSecondsLeft] = useState(DEFAULT_CONFIG.runSeconds);
+  const [secondsLeft, setSecondsLeft] = useState(() => getStoredTimerConfig().runSeconds);
   const [currentRound, setCurrentRound] = useState(1);
   const [totalElapsedSeconds, setTotalElapsedSeconds] = useState(0);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -295,13 +295,15 @@ export default function App() {
     return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, [handleIntervalCompletion]);
 
-  // Save new configuration
+  // Save new configuration to state and localStorage
   const handleSaveConfig = (newConfig) => {
     setConfig(newConfig);
     configRef.current = newConfig;
+    saveStoredTimerConfig(newConfig);
     if (statusRef.current === 'idle') {
-      setSecondsLeft(newConfig.runSeconds);
-      secondsLeftRef.current = newConfig.runSeconds;
+      const dur = currentIntervalRef.current === 'run' ? newConfig.runSeconds : newConfig.walkSeconds;
+      setSecondsLeft(dur);
+      secondsLeftRef.current = dur;
     }
   };
 
@@ -325,7 +327,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isSettingsOpen]);
+  }, [isSettingsOpen, handleStart, handlePause, handleResume, handleReset, handleSkip]);
 
   const totalIntervalSeconds = currentInterval === 'run' ? config.runSeconds : config.walkSeconds;
   const isRunningPhase = currentInterval === 'run';
